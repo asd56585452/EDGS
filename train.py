@@ -41,13 +41,18 @@ def main(cfg: omegaconf.DictConfig):
                     }
         cfg_log_f.write(str(Namespace(**params)))
 
+    # Forward test_views if set in top-level config
+    if "test_views" in cfg and cfg.test_views is not None:
+        cfg.gs.test_views = cfg.test_views
+
     # Init both agents
     gs = hydra.utils.instantiate(cfg.gs) 
 
     # Init trainer and launch training
     trainer = EDGSTrainer(GS=gs,
         training_config=cfg.gs.opt,
-        device=cfg.device)
+        device=cfg.device,
+        log_wandb=(cfg.wandb.mode != "disabled"))
     
     trainer.load_checkpoints(cfg.load)
     trainer.timer.start()

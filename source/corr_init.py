@@ -80,6 +80,9 @@ def select_cameras_kmeans(cameras, K):
     if cameras.shape[1] != 16:
         raise ValueError("Each camera must have 16 values corresponding to a flattened 4x4 matrix.")
 
+    if K >= len(cameras):
+        return list(range(len(cameras)))
+
     # Perform K-means clustering
     cluster_centers, _ = kmeans(cameras, K)
 

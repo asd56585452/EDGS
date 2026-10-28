@@ -1,0 +1,33 @@
+services:
+  edgs:
+    build: .
+    image: asdggg/edgs:latest
+    user: "${UID}:${GID}"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TQDM_MININTERVAL=10
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_QPA_PLATFORM=offscreen
+      - TORCH_HOME=/workspace/cache/torch
+    ports:
+      - "7860-7870:7860-7870"
+    volumes:
+      - .:/workspace
+      - /home/tsaichenghan/GSCodec_Studio:/home/tsaichenghan/GSCodec_Studio
+      - ./cache:/root/.cache
+      - ./cache:/home/ubuntu/.cache
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /media/tsaichenghan/2TBSSD:/media/tsaichenghan/2TBSSD
+    working_dir: /workspace
+    command: /bin/bash
+    shm_size: '8gb'
+    ipc: host
+    deploy:
+      resources:
+        limits:
+          memory: 26G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]

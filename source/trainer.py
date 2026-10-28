@@ -123,7 +123,8 @@ class EDGSTrainer:
                     psnr_test += psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).double()
                     ssim_test += ssim(image, gt_image).double()
                     lpips_splat_test += self.lpips(image, gt_image).detach().double()
-                    if idx in [config['cam_idx']]:
+                    target_cam_idx = min(config['cam_idx'], len(config['cameras']) - 1)
+                    if idx == target_cam_idx:
                         log_gen_images.append(image)
                         log_real_images.append(gt_image)
                 psnr_test /= len(config['cameras'])
@@ -136,9 +137,10 @@ class EDGSTrainer:
                 self.CONSOLE.print("\n[ITER {}], #{} gaussians, Evaluating {}: L1={:.6f},  PSNR={:.6f}, SSIM={:.6f}, LPIPS_splat={:.6f} ".format(
                     self.training_step, len(self.GS.gaussians._xyz), config['name'], l1_test.item(), psnr_test.item(), ssim_test.item(), lpips_splat_test.item()), style="info")
         if self.log_wandb:
-            with torch.no_grad():
-                log_samples(torch.stack((log_real_images[0],log_gen_images[0])) , [], self.training_step, caption="Real and Generated Samples")
-                wandb.log({"time": self.timer.get_elapsed_time()}, step=self.training_step)
+            if len(log_real_images) > 0 and len(log_gen_images) > 0:
+                with torch.no_grad():
+                    log_samples(torch.stack((log_real_images[0],log_gen_images[0])) , [], self.training_step, caption="Real and Generated Samples")
+            wandb.log({"time": self.timer.get_elapsed_time()}, step=self.training_step)
         torch.cuda.empty_cache()
 
     def train_step_gs(self, max_lr = False, no_densify = False):
@@ -252,6 +254,28 @@ class EDGSTrainer:
         with torch.no_grad():
             gaussians =  self.gaussians
             gaussians._scaling =  gaussians.scaling_inverse_activation(gaussians.scaling_activation(gaussians._scaling)*0.5)
+            
+            # Auto-save RoMa initial point cloud as PLY
+            if hasattr(self.scene, 'model_path') and self.scene.model_path:
+                roma_iter0_dir = os.path.join(self.scene.model_path, "point_cloud", "iteration_0")
+                os.makedirs(roma_iter0_dir, exist_ok=True)
+                self.gaussians.save_ply(os.path.join(roma_iter0_dir, "point_cloud.ply"))
+                roma_ply_path = os.path.join(self.scene.model_path, "roma_init.ply")
+                self.gaussians.save_ply(roma_ply_path)
+                
+                # Also save standard XYZ+RGB PLY for generic 3D viewers (CloudCompare / MeshLab)
+                import numpy as np
+                from plyfile import PlyData, PlyElement
+                xyz = self.gaussians._xyz.detach().cpu().numpy()
+                f_dc = self.gaussians._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+                rgb = np.clip((0.5 + 0.28209479177387814 * f_dc) * 255, 0, 255).astype(np.uint8)
+                vertex = np.empty(xyz.shape[0], dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+                                                      ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')])
+                vertex['x'], vertex['y'], vertex['z'] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+                vertex['red'], vertex['green'], vertex['blue'] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+                roma_rgb_ply = os.path.join(self.scene.model_path, "roma_init_rgb.ply")
+                PlyData([PlyElement.describe(vertex, 'vertex')]).write(roma_rgb_ply)
+                print(f"[EDGS] RoMa initial point cloud saved: {roma_ply_path} & {roma_rgb_ply} ({len(xyz)} points)")
         return visualization_dict
     
 

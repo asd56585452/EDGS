@@ -3,6 +3,7 @@ defaults:
   - _self_ 
 
 seed: 228
+test_views: null # e.g. "cam00" or "cam0"
 
 wandb:
   mode: "online" # "disabled" for no logging

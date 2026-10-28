@@ -13,6 +13,7 @@ served_files/
 *.pt
 *.pth
 output*
+cache/
 *.slurm
 *.pyc
 *.ply
