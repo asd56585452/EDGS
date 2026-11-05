@@ -17,7 +17,8 @@ train:
   gs_epochs: 0 # number of 3dgs iterations
   reduce_opacity: True 
   no_densify: False # if True, the model will not be densified
-  max_lr: True 
+  max_lr: True
+  save_final_only: True # 中間步只存 alive_init_idx；chkpnt / point_cloud_step PLY 只在最後一步存
 
 load:
   gs: null #path to 3dgs checkpoint
@@ -35,5 +36,15 @@ init_wC:
   proj_err_tolerance: 0.01
   roma_model: "outdoors" # you can change this to "indoors" or "outdoors"
   add_SfM_init : False
+  # 可選：ref 相機靜態遮罩 npz（key = 影像名不含副檔名，值 = bool，True = 靜態）；ref 抽樣數 = matches_per_ref × 靜態比例
+  static_mask_npz: null
+  # 僅 use=False（自訂 PLY）時有效；預設維持 3DGS create_from_pcd 行為（opacity 0.1、KNN scale）
+  custom_opacity: null # 例如 0.5 = 與原生 RoMa 初始化相同
+  custom_scale: knn # knn | cam_dist（到最近訓練相機距離 × scaling_factor，同原生 RoMa）
+  # 依 PLY label 分組覆寫（0 = 靜態 static, 1 = 動態 dyn）；null = 沿用上面全域值
+  custom_opacity_static: null
+  custom_scale_static: null
+  custom_opacity_dyn: null
+  custom_scale_dyn: null
 
 

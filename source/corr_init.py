@@ -1,3 +1,4 @@
+import os
 import sys
 sys.path.append('../')
 sys.path.append("../submodules")
@@ -549,6 +550,14 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
     viewpoint_stack = scene.getTrainCameras().copy()
     NUM_REFERENCE_FRAMES = min(cfg.num_refs, len(viewpoint_stack))
     NUM_NNS_PER_REFERENCE = min(cfg.nns_per_ref , len(viewpoint_stack))
+    # 可選：靜態遮罩（Static RoMa + Dynamic DA3）。npz 以影像名（不含副檔名）為 key，值為原圖解析度 bool（True = 靜態）。
+    # 只遮 ref 相機的 certainty，ref 的抽樣數改為 round(matches_per_ref × 靜態比例)；其餘流程不變。
+    static_masks = None
+    if cfg.get("static_mask_npz", None):
+        _npz = np.load(cfg.static_mask_npz)
+        static_masks = {k: _npz[k] for k in _npz.files}
+        print(f"[EDGS] static masks: {cfg.static_mask_npz} ({len(static_masks)} cams)")
+    debug_cert = {}
     # Select cameras using K-means
     viewpoint_cam_all = torch.stack([x.world_view_transform.flatten() for x in viewpoint_stack], axis=0)
 
@@ -595,6 +604,18 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
                 source_idx=source_idx,
                 verbose=verbose, output_dict=visualizations
             )
+            M_ref = M
+            ref_key = os.path.splitext(viewpoint_stack[source_idx].image_name)[0]
+            if static_masks is not None and ref_key in static_masks:
+                sm_np = static_masks[ref_key]
+                sm = torch.from_numpy(sm_np).float()[None, None].to(certainties_max.device)
+                sm = F.interpolate(sm, size=tuple(certainties_max.shape), mode="nearest")[0, 0]
+                certainties_max = certainties_max * sm
+                M_ref = int(round(M * float(sm_np.mean())))
+                print(f"[EDGS] ref {ref_key}: static {float(sm_np.mean()):.4f} -> {M_ref} samples")
+            if static_masks is not None:
+                debug_cert[ref_key] = F.interpolate(certainties_max[None, None], scale_factor=0.25,
+                                                    mode="area")[0, 0].half().cpu().numpy()
 
 
         # Triangulate keypoints
@@ -611,7 +632,7 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
             # Select based on certainty elements with high confidence. These are basically all of
             # kptsA_np.
             good_samples = torch.multinomial(certainty,
-                                             num_samples=min(expansion_factor * M, len(certainty)),
+                                             num_samples=min(expansion_factor * M_ref, len(certainty)),
                                              replacement=False)
 
         certainties_max, warps_max, certainties_max_idcs, imA, imB_compound, certainties_all, warps_all
@@ -637,10 +658,10 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
                 proj_matrices_A = viewpoint_stack[source_idx].full_proj_transform
                 proj_matrices_B = viewpoint_stack[closest_indices_selected[source_idx, NN_idx]].full_proj_transform
                 triangulated_points, triangulated_points_errors_proj1, triangulated_points_errors_proj2 = triangulate_points(
-                    P1=torch.stack([proj_matrices_A] * M, axis=0),
-                    P2=torch.stack([proj_matrices_B] * M, axis=0),
-                    k1_x=kptsA_np[:M, 0], k1_y=kptsA_np[:M, 1],
-                    k2_x=kptsB_np[:M, 0], k2_y=kptsB_np[:M, 1])
+                    P1=torch.stack([proj_matrices_A] * M_ref, axis=0),
+                    P2=torch.stack([proj_matrices_B] * M_ref, axis=0),
+                    k1_x=kptsA_np[:M_ref, 0], k1_y=kptsA_np[:M_ref, 1],
+                    k2_x=kptsB_np[:M_ref, 0], k2_y=kptsB_np[:M_ref, 1])
 
                 reference_image_dict["triangulated_points"].append(triangulated_points)
                 reference_image_dict["triangulated_points_errors_proj1"].append(triangulated_points_errors_proj1)
@@ -685,7 +706,10 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
                                     torch.cat(all_new_scaling, dim=0)[prune_mask].to(device),
                                     torch.cat(all_new_rotation, dim=0)[prune_mask].to(device),
                                     new_tmp_radii[prune_mask].to(device))
-    
+    if debug_cert and getattr(scene, "model_path", None):
+        # 遮罩後的 C_max（1/4 解析度），供 RRD 視覺化
+        np.savez_compressed(os.path.join(scene.model_path, "roma_masked_cert.npz"), **debug_cert)
+
     return viewpoint_stack, closest_indices_selected, visualizations
 
 

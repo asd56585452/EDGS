@@ -1,4 +1,5 @@
 import torch
+import os
 from random import randint
 from tqdm.rich import trange
 from tqdm import tqdm as tqdm
@@ -43,8 +44,9 @@ class EDGSTrainer:
         self.training_step = 1
         self.gs_step = 0
         self.CONSOLE = Console(width=120, theme=custom_theme)
-        self.saving_iterations = training_config.save_iterations
-        self.evaluate_iterations = None
+        self.saving_iterations = [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000]
+        self.evaluate_iterations = [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000]
+        self.eval_history = []
         self.batch_size = training_config.batch_size
         self.ema_loss_for_log = 0.0
 
@@ -69,7 +71,15 @@ class EDGSTrainer:
 
     def train(self, train_cfg):
         # 3DGS training
-        self.CONSOLE.print("Train 3DGS for {} iterations".format(train_cfg.gs_epochs), style="info")    
+        self.CONSOLE.print("Train 3DGS for {} iterations".format(train_cfg.gs_epochs), style="info")
+        # 超過 5000 步的長訓練：每 500 步評估、每 2500 步存檔（5000 步內的清單不變）
+        end_step = self.training_step + train_cfg.gs_epochs
+        self.evaluate_iterations = sorted(set(self.evaluate_iterations) | set(range(5500, end_step, 500)))
+        self.saving_iterations = sorted(set(self.saving_iterations) | set(range(7500, end_step, 2500)))
+        self.final_step = end_step - 1
+        self.save_final_only = bool(train_cfg.get("save_final_only", True))
+        if self.save_final_only:
+            self.saving_iterations = sorted(set(self.saving_iterations) | {self.final_step})
         with trange(self.training_step, self.training_step + train_cfg.gs_epochs, desc="[green]Train gaussians") as progress_bar:
             for self.training_step in progress_bar:
                 radii = self.train_step_gs(max_lr=train_cfg.max_lr, no_densify=train_cfg.no_densify)
@@ -136,6 +146,32 @@ class EDGSTrainer:
                             f"{config['name']}/SSIM": ssim_test.item(), f"{config['name']}/LPIPS_splat": lpips_splat_test.item()}, step = self.training_step)
                 self.CONSOLE.print("\n[ITER {}], #{} gaussians, Evaluating {}: L1={:.6f},  PSNR={:.6f}, SSIM={:.6f}, LPIPS_splat={:.6f} ".format(
                     self.training_step, len(self.GS.gaussians._xyz), config['name'], l1_test.item(), psnr_test.item(), ssim_test.item(), lpips_splat_test.item()), style="info")
+
+                if config['name'] == 'test' and len(config['cameras']) > 0:
+                    try:
+                        render_dir = os.path.join(self.scene.model_path, "renders")
+                        os.makedirs(render_dir, exist_ok=True)
+                        from torchvision.utils import save_image
+                        test_view = config['cameras'][0]
+                        test_render = torch.clamp(self.GS(test_view)["render"], 0.0, 1.0)
+                        test_gt = torch.clamp(test_view.original_image.to(self.device), 0.0, 1.0)
+                        side_by_side = torch.cat([test_gt, test_render], dim=-1)
+                        save_image(side_by_side, os.path.join(render_dir, f"val_step{self.training_step}_0000.png"))
+                        save_image(test_render, os.path.join(render_dir, f"val_step{self.training_step}_render.png"))
+                        save_image(test_gt, os.path.join(render_dir, f"val_step{self.training_step}_gt.png"))
+                    except Exception as e:
+                        print(f"Error saving test render: {e}")
+
+                    self.eval_history.append({
+                        "step": self.training_step,
+                        "psnr": float(psnr_test.item()),
+                        "ssim": float(ssim_test.item()),
+                        "lpips": float(lpips_splat_test.item()),
+                        "splats": len(self.GS.gaussians._xyz)
+                    })
+                    import json
+                    with open(os.path.join(self.scene.model_path, "eval_stats.json"), "w") as f:
+                        json.dump(self.eval_history, f, indent=2)
         if self.log_wandb:
             if len(log_real_images) > 0 and len(log_gen_images) > 0:
                 with torch.no_grad():
@@ -209,12 +245,55 @@ class EDGSTrainer:
           
 
     def save_model(self):
-        print("\n[ITER {}] Saving Gaussians".format(self.gs_step))
+        if getattr(self, "alive_init_idx", None) is not None and len(self.alive_init_idx) == len(self.GS.gaussians._xyz):
+            import numpy as np
+            np.save(os.path.join(self.scene.model_path, f"alive_init_idx_step_{self.gs_step}.npy"),
+                    self.alive_init_idx.cpu().numpy())
+        # save_final_only：中間步只留小檔（alive_init_idx），checkpoint / 點雲 PLY 只在最後一步存，避免塞滿硬碟
+        if getattr(self, "save_final_only", False) and self.training_step != getattr(self, "final_step", None):
+            return
+        print(f"[ITER {self.gs_step}] Saving Gaussians & Standard Universal PLY")
         self.scene.save(self.gs_step)
-        print("\n[ITER {}] Saving Checkpoint".format(self.gs_step))
+        root_ply_path = os.path.join(self.scene.model_path, f"point_cloud_step_{self.gs_step}.ply")
+        self.GS.gaussians.save_ply(root_ply_path)
+        print(f"[ITER {self.gs_step}] Saving Checkpoint: {root_ply_path}")
+        try:
+            import numpy as np
+            xyz = self.GS.gaussians.get_xyz.detach().cpu().numpy()
+            f_dc = self.GS.gaussians._features_dc.detach().cpu().numpy().reshape(-1, 3)
+            rgb = np.clip((f_dc * 0.28209479177387814 + 0.5) * 255.0, 0, 255).astype(np.uint8)
+            header_lines = [
+                "ply",
+                "format binary_little_endian 1.0",
+                f"element vertex {len(xyz)}",
+                "property float x",
+                "property float y",
+                "property float z",
+                "property uchar red",
+                "property uchar green",
+                "property uchar blue",
+                "end_header"
+            ]
+            header_bytes = "\n".join(header_lines).encode("ascii") + b"\n"
+            out_data = np.empty(len(xyz), dtype=[
+                ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                ("red", "u1"), ("green", "u1"), ("blue", "u1")
+            ])
+            out_data["x"] = xyz[:, 0]
+            out_data["y"] = xyz[:, 1]
+            out_data["z"] = xyz[:, 2]
+            out_data["red"] = rgb[:, 0]
+            out_data["green"] = rgb[:, 1]
+            out_data["blue"] = rgb[:, 2]
+            rgb_ply_path = os.path.join(self.scene.model_path, f"point_cloud_step_{self.gs_step}_rgb.ply")
+            with open(rgb_ply_path, "wb") as f_rgb:
+                f_rgb.write(header_bytes)
+                f_rgb.write(out_data.tobytes())
+            print(f"[ITER {self.gs_step}] Saving MeshLab RGB PLY: {rgb_ply_path}")
+        except Exception as e:
+            print(f"Warning: failed to save RGB ply: {e}")
         torch.save((self.GS.gaussians.capture(), self.gs_step),
                 self.scene.model_path + "/chkpnt" + str(self.gs_step) + ".pth")
-
 
     def init_with_corr(self, cfg, verbose=False, roma_model=None): 
         """
@@ -226,6 +305,65 @@ class EDGSTrainer:
                 it every time.  
         """
         if not cfg.use:
+            with torch.no_grad():
+                gaussians = self.gaussians
+                # 可選：讓自訂 PLY 的初始 opacity / scale 與原生 RoMa 路徑一致（init_gaussians_with_corr）
+                # custom_opacity / custom_scale 套用全部點；*_static / *_dyn 依 PLY 的 label 欄位
+                # （0 = 靜態, 1 = 動態）覆寫各自群組，未設定則沿用全域值。
+                n = len(gaussians._xyz)
+                dev = gaussians._xyz.device
+                labels = None
+                ply_field = {}   # 'ply' 模式：逐點初始值 init_opacity（已 sigmoid）、init_scale（×0.5 前的世界尺寸）
+                input_ply = os.path.join(self.scene.model_path, "input.ply")
+                if os.path.exists(input_ply):
+                    import numpy as np
+                    from plyfile import PlyData
+                    v = PlyData.read(input_ply)["vertex"]
+                    if "label" in v.data.dtype.names and len(v["label"]) == n:
+                        labels = torch.from_numpy(np.asarray(v["label"]).astype(np.int64)).to(dev)
+                    for k in ("init_opacity", "init_scale"):
+                        if k in v.data.dtype.names and len(v[k]) == n:
+                            ply_field[k] = torch.from_numpy(np.asarray(v[k]).astype(np.float32)).to(dev)
+                groups = {"all": torch.ones(n, dtype=torch.bool, device=dev)}
+                if labels is not None:
+                    groups = {"static": labels == 0, "dyn": labels == 1}
+                elif any(cfg.get(f"custom_{k}_{g}", None) is not None
+                         for k in ("opacity", "scale") for g in ("static", "dyn")):
+                    print("[EDGS] ⚠️ custom_*_static/_dyn 已設定，但 input.ply 沒有 label 欄位，改用全域設定")
+                d_cam = None
+                msgs = []
+                for g, m in groups.items():
+                    op = cfg.get(f"custom_opacity_{g}", None) if g != "all" else None
+                    op = cfg.get("custom_opacity", None) if op is None else op
+                    sc = cfg.get(f"custom_scale_{g}", None) if g != "all" else None
+                    sc = cfg.get("custom_scale", "knn") if sc is None else sc
+                    if op == "ply":
+                        assert "init_opacity" in ply_field, "custom_opacity=ply 但 input.ply 沒有 init_opacity"
+                        o = ply_field["init_opacity"][m].clamp(1e-6, 1 - 1e-6).unsqueeze(1)
+                        gaussians._opacity.data[m] = gaussians.inverse_opacity_activation(o)
+                    elif op is not None:
+                        gaussians._opacity.data[m] = gaussians.inverse_opacity_activation(
+                            torch.full_like(gaussians._opacity.data[m], float(op)))
+                    if sc == "ply":
+                        assert "init_scale" in ply_field, "custom_scale=ply 但 input.ply 沒有 init_scale"
+                        gaussians._scaling.data[m] = gaussians.scaling_inverse_activation(
+                            ply_field["init_scale"][m].unsqueeze(1).repeat(1, 3))
+                    elif sc == "cam_dist":
+                        if d_cam is None:
+                            centers = torch.stack([c.camera_center for c in self.scene.getTrainCameras()]).to(dev)
+                            d_cam = torch.cdist(gaussians._xyz.data, centers).min(dim=1).values
+                        gaussians._scaling.data[m] = gaussians.scaling_inverse_activation(
+                            (d_cam[m] * cfg.scaling_factor).unsqueeze(1).repeat(1, 3))
+                    msgs.append(f"{g}({int(m.sum())}): opacity={op if op is not None else 'default 0.1'}, scale={sc}")
+                print("[EDGS] custom init: " + " | ".join(msgs))
+                gaussians._scaling = gaussians.scaling_inverse_activation(gaussians.scaling_activation(gaussians._scaling)*0.5)
+                if hasattr(self.scene, "model_path") and self.scene.model_path:
+                    init_dir = os.path.join(self.scene.model_path, "point_cloud", "iteration_0")
+                    os.makedirs(init_dir, exist_ok=True)
+                    self.gaussians.save_ply(os.path.join(init_dir, "point_cloud.ply"))
+                    self.gaussians.save_ply(os.path.join(self.scene.model_path, "custom_init.ply"))
+            self.init_splats = len(self.gaussians._xyz)
+            print(f"[EDGS] Initialized with custom point cloud: {self.init_splats} points")
             return None
         N_splats_at_init = len(self.GS.gaussians._xyz)
         print("N_splats_at_init:", N_splats_at_init)
@@ -276,6 +414,7 @@ class EDGSTrainer:
                 roma_rgb_ply = os.path.join(self.scene.model_path, "roma_init_rgb.ply")
                 PlyData([PlyElement.describe(vertex, 'vertex')]).write(roma_rgb_ply)
                 print(f"[EDGS] RoMa initial point cloud saved: {roma_ply_path} & {roma_rgb_ply} ({len(xyz)} points)")
+        self.init_splats = len(self.gaussians._xyz)
         return visualization_dict
     
 
@@ -283,6 +422,11 @@ class EDGSTrainer:
         self.GS.gaussians.tmp_radii = radii
         if self.gs_step < self.training_config.densify_until_iter:
             prune_mask = (self.GS.gaussians.get_opacity < min_opacity).squeeze()
+            # 追蹤存活高斯對應的初始點索引（no_densify 時只有剪枝會改變點數，順序保留）
+            if getattr(self, "alive_init_idx", None) is None:
+                self.alive_init_idx = torch.arange(len(prune_mask), device=prune_mask.device)
+            if len(self.alive_init_idx) == len(prune_mask):
+                self.alive_init_idx = self.alive_init_idx[~prune_mask]
             self.GS.gaussians.prune_points(prune_mask)
             torch.cuda.empty_cache()
         self.GS.gaussians.tmp_radii = None

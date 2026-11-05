@@ -23,7 +23,7 @@ opt:
   densify_until_iter: 15000
   densify_grad_threshold: 0.0002
   random_background: false
-  save_iterations: [3000, 7000, 15000, 30000]
+  save_iterations: [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000]
   batch_size: 64
   exposure_lr_init: 0.01
   exposure_lr_final: 0.0001
@@ -49,4 +49,5 @@ dataset:
   data_device: cuda
   eval: false
   depths: ""
+  ply_path: ""
   train_test_exp: False

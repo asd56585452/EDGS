@@ -1,0 +1,33 @@
+diff --git a/scene/__init__.py b/scene/__init__.py
+index 8091614..db70d25 100644
+--- a/scene/__init__.py
++++ b/scene/__init__.py
+@@ -48,6 +48,12 @@ class Scene:
+         else:
+             assert False, "Could not recognize scene type!"
+ 
++        if hasattr(args, "ply_path") and args.ply_path and os.path.exists(args.ply_path):
++            from scene.dataset_readers import fetchPly
++            print(f"[EDGS] Overriding initial point cloud with custom PLY: {args.ply_path}")
++            custom_pcd = fetchPly(args.ply_path)
++            scene_info = scene_info._replace(point_cloud=custom_pcd, ply_path=args.ply_path)
++
+         if not self.loaded_iter:
+             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+                 dest_file.write(src_file.read())
+diff --git a/scene/dataset_readers.py b/scene/dataset_readers.py
+index 493d98d..b3f6761 100644
+--- a/scene/dataset_readers.py
++++ b/scene/dataset_readers.py
+@@ -122,7 +122,10 @@ def fetchPly(path):
+     vertices = plydata['vertex']
+     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
++    try:
++        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
++    except Exception:
++        normals = np.zeros_like(positions)
+     return BasicPointCloud(points=positions, colors=colors, normals=normals)
+ 
+ def storePly(path, xyz, rgb):
