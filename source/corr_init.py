@@ -558,6 +558,7 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
         static_masks = {k: _npz[k] for k in _npz.files}
         print(f"[EDGS] static masks: {cfg.static_mask_npz} ({len(static_masks)} cams)")
     debug_cert = {}
+    all_src_names = []
     # Select cameras using K-means
     viewpoint_cam_all = torch.stack([x.world_view_transform.flatten() for x in viewpoint_stack], axis=0)
 
@@ -679,6 +680,7 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
         with torch.no_grad():
             new_xyz = NNs_triangulated_points_selected[:, :-1]
             all_new_xyz.append(new_xyz)  # seeked_splats
+            all_src_names += [os.path.splitext(viewpoint_cam1.image_name)[0]] * N
             all_new_features_dc.append(RGB2SH(torch.tensor(kptsA_color.astype(np.float32) / 255.)).unsqueeze(1))
             all_new_features_rest.append(torch.stack([gaussians._features_rest[-1].clone().detach() * 0.] * N, dim=0))
             # new version that sets points with large error invisible
@@ -706,9 +708,12 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
                                     torch.cat(all_new_scaling, dim=0)[prune_mask].to(device),
                                     torch.cat(all_new_rotation, dim=0)[prune_mask].to(device),
                                     new_tmp_radii[prune_mask].to(device))
-    if debug_cert and getattr(scene, "model_path", None):
-        # 遮罩後的 C_max（1/4 解析度），供 RRD 視覺化
-        np.savez_compressed(os.path.join(scene.model_path, "roma_masked_cert.npz"), **debug_cert)
+    if getattr(scene, "model_path", None):
+        # 每個新點的 ref 相機名稱（順序同 roma_init.ply），供 static.ply 的 src_cam 欄位
+        np.save(os.path.join(scene.model_path, "roma_init_src_cam.npy"), np.asarray(all_src_names))
+        if debug_cert:
+            # 遮罩後的 C_max（1/4 解析度），供 RRD 視覺化
+            np.savez_compressed(os.path.join(scene.model_path, "roma_masked_cert.npz"), **debug_cert)
 
     return viewpoint_stack, closest_indices_selected, visualizations
 
