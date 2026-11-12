@@ -559,6 +559,18 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
         print(f"[EDGS] static masks: {cfg.static_mask_npz} ({len(static_masks)} cams)")
     debug_cert = {}
     all_src_names = []
+    # 可選：低紋理（平坦）區減點。ref 影像（訓練解析度）k×k 視窗 RGB 標準差（0–255，三通道平均）< flat_tau 視為平坦。
+    # 先照原版抽 M_ref 個樣本（全域 RNG 串流不變 → 非平坦樣本與原版完全相同），平坦樣本再以 flat_keep 機率保留
+    # （獨立 Generator），保留的平坦點 scale × flat_scale_mult（null = 1/√flat_keep，維持覆蓋面積）。flat_tau ≤ 0 = 關閉。
+    flat_tau = float(cfg.get("flat_tau", 0) or 0)
+    flat_k = int(cfg.get("flat_k", 9))
+    flat_keep = float(cfg.get("flat_keep", 1.0))
+    flat_scale_mult = cfg.get("flat_scale_mult", None)
+    flat_scale_mult = 1.0 / float(np.sqrt(max(flat_keep, 1e-6))) if flat_scale_mult is None else float(flat_scale_mult)
+    flat_gen = torch.Generator(device="cpu").manual_seed(int(cfg.get("flat_seed", 0)))
+    all_flat, debug_flat, flat_stats = [], {}, {}
+    if flat_tau > 0:
+        print(f"[EDGS] flat thinning: k={flat_k} tau={flat_tau} keep={flat_keep} scale_mult={flat_scale_mult:.4f}")
     # Select cameras using K-means
     viewpoint_cam_all = torch.stack([x.world_view_transform.flatten() for x in viewpoint_stack], axis=0)
 
@@ -636,6 +648,28 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
                                              num_samples=min(expansion_factor * M_ref, len(certainty)),
                                              replacement=False)
 
+            is_flat = torch.zeros(len(good_samples), dtype=torch.bool, device=good_samples.device)
+            if flat_tau > 0:
+                x = torch.from_numpy(np.ascontiguousarray(imA)).to(good_samples.device).permute(2, 0, 1)[None].float()
+                pool = lambda t: F.avg_pool2d(t, flat_k, stride=1, padding=flat_k // 2, count_include_pad=False)
+                mu = pool(x)
+                local_std = (pool(x * x) - mu * mu).clamp_min(0).sqrt().mean(1, keepdim=True)
+                if tuple(local_std.shape[-2:]) != tuple(certainties_max.shape):
+                    local_std = F.interpolate(local_std, size=tuple(certainties_max.shape), mode="nearest")
+                flat_map = local_std[0, 0] < flat_tau
+                is_flat = flat_map.reshape(-1)[good_samples]
+                keep = ~is_flat | (torch.rand(len(good_samples), generator=flat_gen) < flat_keep).to(good_samples.device)
+                n_before = len(good_samples)
+                good_samples, is_flat = good_samples[keep], is_flat[keep]
+                M_ref = len(good_samples)
+                flat_stats[ref_key] = {"pix_flat": round(float(flat_map.float().mean()), 4), "n_before": n_before,
+                                       "n_flat_before": int(n_before - int(keep.sum()) + int(is_flat.sum())),
+                                       "n_after": M_ref, "n_flat_after": int(is_flat.sum())}
+                debug_flat[ref_key] = F.interpolate(flat_map[None, None].float(), scale_factor=0.25,
+                                                    mode="area")[0, 0].half().cpu().numpy()
+                print(f"[EDGS] ref {ref_key}: flat pix {flat_stats[ref_key]['pix_flat']:.3f}, "
+                      f"samples {n_before} -> {M_ref} (flat {flat_stats[ref_key]['n_flat_before']} -> {int(is_flat.sum())})")
+
         certainties_max, warps_max, certainties_max_idcs, imA, imB_compound, certainties_all, warps_all
         reference_image_dict = {
             "ref_image": imA,
@@ -693,7 +727,10 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
             dist_points_to_cam1 = torch.linalg.norm(viewpoint_cam1.camera_center.clone().detach() - new_xyz,
                                                     dim=1, ord=2)
             #all_new_scaling.append(torch.log(((dist_points_to_cam1) / 1. * scaling_factor).unsqueeze(1).repeat(1, 3)))
-            all_new_scaling.append(gaussians.scaling_inverse_activation((dist_points_to_cam1 * scaling_factor).unsqueeze(1).repeat(1, 3)))
+            scale_mult = torch.where(is_flat.to(new_xyz.device), flat_scale_mult, 1.0).to(new_xyz.dtype)
+            all_new_scaling.append(gaussians.scaling_inverse_activation(
+                (dist_points_to_cam1 * scaling_factor * scale_mult).unsqueeze(1).repeat(1, 3)))
+            all_flat.append(is_flat.cpu().numpy())
             all_new_rotation.append(torch.stack([gaussians._rotation[-1].clone().detach()] * N, dim=0))
 
     all_new_xyz = torch.cat(all_new_xyz, dim=0) 
@@ -714,6 +751,13 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
         if debug_cert:
             # 遮罩後的 C_max（1/4 解析度），供 RRD 視覺化
             np.savez_compressed(os.path.join(scene.model_path, "roma_masked_cert.npz"), **debug_cert)
+        if flat_tau > 0:
+            # 每點是否為平坦區樣本（順序同 roma_init.ply）、各 ref 平坦遮罩（1/4 解析度）與點數統計
+            np.save(os.path.join(scene.model_path, "roma_init_flat.npy"), np.concatenate(all_flat))
+            np.savez_compressed(os.path.join(scene.model_path, "roma_flat_mask.npz"), **debug_flat)
+            import json
+            json.dump({"k": flat_k, "tau": flat_tau, "keep": flat_keep, "scale_mult": flat_scale_mult, "refs": flat_stats},
+                      open(os.path.join(scene.model_path, "roma_flat_stats.json"), "w"), indent=1)
 
     return viewpoint_stack, closest_indices_selected, visualizations
 

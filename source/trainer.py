@@ -9,6 +9,7 @@ import sys
 
 sys.path.append('./submodules/gaussian-splatting/')
 import lpips
+import time
 from source.losses import ssim, l1_loss, psnr
 from rich.console import Console
 from rich.theme import Theme
@@ -77,6 +78,10 @@ class EDGSTrainer:
         self.evaluate_iterations = sorted(set(self.evaluate_iterations) | set(range(5500, end_step, 500)))
         self.saving_iterations = sorted(set(self.saving_iterations) | set(range(7500, end_step, 2500)))
         self.final_step = end_step - 1
+        # lean：去掉每步固定開銷（empty_cache、無剪枝時仍重建 optimizer），評估只在最後一步；數值結果不變
+        self.lean = bool(train_cfg.get("lean", False))
+        if self.lean:
+            self.evaluate_iterations = [self.final_step]
         self.save_final_only = bool(train_cfg.get("save_final_only", True))
         if self.save_final_only:
             self.saving_iterations = sorted(set(self.saving_iterations) | {self.final_step})
@@ -112,6 +117,13 @@ class EDGSTrainer:
 
 
     def evaluate(self):
+        _t_eval = time.time()
+        try:
+            self._evaluate()
+        finally:
+            self.eval_time = getattr(self, "eval_time", 0.0) + time.time() - _t_eval
+
+    def _evaluate(self):
         torch.cuda.empty_cache()
         log_gen_images, log_real_images = [], []
         validation_configs = ({'name': 'test', 'cameras': self.scene.getTestCameras(), 'cam_idx': self.training_config.TEST_CAM_IDX_TO_LOG},
@@ -427,7 +439,10 @@ class EDGSTrainer:
                 self.alive_init_idx = torch.arange(len(prune_mask), device=prune_mask.device)
             if len(self.alive_init_idx) == len(prune_mask):
                 self.alive_init_idx = self.alive_init_idx[~prune_mask]
-            self.GS.gaussians.prune_points(prune_mask)
-            torch.cuda.empty_cache()
+            if not getattr(self, "lean", False):
+                self.GS.gaussians.prune_points(prune_mask)
+                torch.cuda.empty_cache()
+            elif bool(prune_mask.any()):
+                self.GS.gaussians.prune_points(prune_mask)
         self.GS.gaussians.tmp_radii = None
 

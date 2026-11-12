@@ -73,6 +73,7 @@ def main(cfg: omegaconf.DictConfig):
         "init_time_sec": init_time,
         "train_time_sec": train_time,
         "total_time_sec": init_time + train_time,
+        "eval_time_sec": getattr(trainer, "eval_time", None),
         "init_splats": getattr(trainer, "init_splats", len(trainer.GS.gaussians._xyz)),
         "final_splats": len(trainer.GS.gaussians._xyz)
     }
