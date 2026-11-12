@@ -19,6 +19,14 @@ train:
   no_densify: False # if True, the model will not be densified
   max_lr: True
   lean: False # True = 評估只在最後一步、prune 無點可剪時跳過 prune_points / empty_cache（數值不變，只省時間）
+  # 探針（source/train_probe.py），預設全關
+  profile_steps: null   # 例 [2000, 2049]：torch.profiler → profile_kernels.txt / profile_phases.json
+  render_stats: False   # 每步 num_rendered（高斯×tile）/ 可見數 → render_stats.npz
+  attr_log_every: 0     # >0：每 N 步記屬性變化量與梯度 → attr_log.json / attr_final_delta.npz
+  eval_steps: null      # 額外評估步（lean 時也評估），例 [3000, 5000]
+  lr_decay_start: null  # xyz lr 從這一步開始 log-linear 衰減（不設 = 原排程）
+  lr_decay_factor: 1.0  # 最後一步 xyz lr = 原值 × factor
+  freeze: null          # 例 [xyz] 或 [scaling,rotation]：這些群組 lr = 0
   save_final_only: True # 中間步只存 alive_init_idx；chkpnt / point_cloud_step PLY 只在最後一步存
 
 load:

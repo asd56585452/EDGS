@@ -9,6 +9,7 @@ import sys
 
 sys.path.append('./submodules/gaussian-splatting/')
 import lpips
+import contextlib
 import time
 from source.losses import ssim, l1_loss, psnr
 from rich.console import Console
@@ -82,17 +83,44 @@ class EDGSTrainer:
         self.lean = bool(train_cfg.get("lean", False))
         if self.lean:
             self.evaluate_iterations = [self.final_step]
+        # 額外評估步（lean 時也有效），例 [3000, 5000]
+        extra_eval = [int(x) for x in (train_cfg.get("eval_steps", None) or [])]
+        if extra_eval:
+            self.evaluate_iterations = sorted(set(self.evaluate_iterations) | set(extra_eval))
+        # 部分衰減：lr_decay_start 前 xyz lr 照原排程；之後到最後一步 log-linear 乘到 lr_decay_factor 倍
+        self.lr_decay_start = train_cfg.get("lr_decay_start", None)
+        self.lr_decay_factor = float(train_cfg.get("lr_decay_factor", 1.0))
+        if self.lr_decay_start is not None:
+            print(f"[EDGS] xyz lr decay: start {self.lr_decay_start}, ×{self.lr_decay_factor} at step {self.final_step}")
         self.save_final_only = bool(train_cfg.get("save_final_only", True))
         if self.save_final_only:
             self.saving_iterations = sorted(set(self.saving_iterations) | {self.final_step})
+        # 探針（source/train_probe.py，預設全關）
+        from source import train_probe as tp
+        ps = train_cfg.get("profile_steps", None)
+        self.probe_prof = tp.Profiler(ps[0], ps[1], self.scene.model_path) if ps else None
+        self.probe_rs = tp.RenderStats() if train_cfg.get("render_stats", False) else None
+        ae = int(train_cfg.get("attr_log_every", 0) or 0)
+        self.probe_attr = tp.AttrLogger(self, ae) if ae > 0 else None
+        self.freeze = list(train_cfg.get("freeze", None) or [])
+        if self.freeze:
+            print(f"[PROBE] freeze: {self.freeze}")
         with trange(self.training_step, self.training_step + train_cfg.gs_epochs, desc="[green]Train gaussians") as progress_bar:
             for self.training_step in progress_bar:
+                if self.probe_prof is not None:
+                    self.probe_prof.step_begin(self.gs_step + 1)
                 radii = self.train_step_gs(max_lr=train_cfg.max_lr, no_densify=train_cfg.no_densify)
                 with torch.no_grad():
-                    if train_cfg.no_densify:
-                        self.prune(radii)
-                    else:
-                        self.densify_and_prune(radii)
+                    with self._rf("probe/prune"):
+                        if train_cfg.no_densify:
+                            self.prune(radii)
+                        else:
+                            self.densify_and_prune(radii)
+                    if self.probe_prof is not None:
+                        self.probe_prof.step_end(self.gs_step)
+                    if self.probe_attr is not None and (self.gs_step % self.probe_attr.every == 0
+                                                        or self.training_step == self.final_step):
+                        self.probe_attr.snapshot(self.gs_step, final=self.training_step == self.final_step)
                     if train_cfg.reduce_opacity:
                         # Slightly reduce opacity every few steps:
                         if self.gs_step < self.training_config.densify_until_iter and self.gs_step % 10 == 0:
@@ -114,7 +142,14 @@ class EDGSTrainer:
                             self.evaluate()
 
                     self.timer.start()
+        if self.probe_rs is not None:
+            self.probe_rs.save(os.path.join(self.scene.model_path, "render_stats.npz"))
+        if self.probe_attr is not None:
+            self.probe_attr.save()
 
+    def _rf(self, name):
+        p = getattr(self, "probe_prof", None)
+        return p.rf(name, self.gs_step) if p is not None else contextlib.nullcontext()
 
     def evaluate(self):
         _t_eval = time.time()
@@ -197,6 +232,14 @@ class EDGSTrainer:
             self.GS.gaussians.update_learning_rate(max(self.gs_step, 8_000))
         else:
             self.GS.gaussians.update_learning_rate(self.gs_step)
+        if getattr(self, "lr_decay_start", None) is not None and self.gs_step > self.lr_decay_start:
+            r = min((self.gs_step - self.lr_decay_start) / max(self.final_step - self.lr_decay_start, 1), 1.0)
+            for pg in self.GS.gaussians.optimizer.param_groups:
+                if pg["name"] == "xyz":
+                    pg["lr"] *= self.lr_decay_factor ** r
+        if getattr(self, "freeze", None):
+            from source.train_probe import apply_freeze
+            apply_freeze(self.GS.gaussians.optimizer, self.freeze)
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if self.gs_step % 1000 == 0:
             self.GS.gaussians.oneupSHdegree()
@@ -206,15 +249,20 @@ class EDGSTrainer:
             self.viewpoint_stack = self.scene.getTrainCameras().copy()
         viewpoint_cam = self.viewpoint_stack.pop(randint(0, len(self.viewpoint_stack) - 1))
       
-        render_pkg = self.GS(viewpoint_cam=viewpoint_cam)
+        with self._rf("probe/render_fwd"):
+            render_pkg = self.GS(viewpoint_cam=viewpoint_cam)
+        if getattr(self, "probe_rs", None) is not None:
+            self.probe_rs.record(self.gs_step, render_pkg["radii"], len(self.GS.gaussians._xyz),
+                                 int(render_pkg["render"].shape[1] * render_pkg["render"].shape[2]))
         image = render_pkg["render"]
         # Loss
-        gt_image = viewpoint_cam.original_image.to(self.device)
-        L1_loss = l1_loss(image, gt_image)
+        with self._rf("probe/loss_fwd"):
+            gt_image = viewpoint_cam.original_image.to(self.device)
+            L1_loss = l1_loss(image, gt_image)
 
-        ssim_loss = (1.0 - ssim(image, gt_image))
-        loss = (1.0 - self.training_config.lambda_dssim) * L1_loss + \
-               self.training_config.lambda_dssim * ssim_loss
+            ssim_loss = (1.0 - ssim(image, gt_image))
+            loss = (1.0 - self.training_config.lambda_dssim) * L1_loss + \
+                   self.training_config.lambda_dssim * ssim_loss
         self.timer.pause() 
         self.logs_losses[self.training_step] = {"loss": loss.item(),
                                                 "L1_loss": L1_loss.item(),
@@ -226,7 +274,10 @@ class EDGSTrainer:
         self.ema_loss_for_log = 0.4 * self.logs_losses[self.training_step]["loss"] + 0.6 * self.ema_loss_for_log
         self.timer.start()
         self.GS_optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        with self._rf("probe/backward"):
+            loss.backward()
+        if getattr(self, "probe_attr", None) is not None:
+            self.probe_attr.accumulate_grads()
         with torch.no_grad():
             if self.gs_step < self.training_config.densify_until_iter and not no_densify:
                 self.GS.gaussians.max_radii2D[render_pkg["visibility_filter"]] = torch.max(
@@ -236,8 +287,9 @@ class EDGSTrainer:
                                                                      render_pkg["visibility_filter"])
 
         # Optimizer step
-        self.GS_optimizer.step()
-        self.GS_optimizer.zero_grad(set_to_none=True)
+        with self._rf("probe/optimizer"):
+            self.GS_optimizer.step()
+            self.GS_optimizer.zero_grad(set_to_none=True)
         return render_pkg["radii"]
 
     def densify_and_prune(self, radii = None):
