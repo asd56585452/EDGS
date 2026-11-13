@@ -568,6 +568,11 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
     flat_scale_mult = cfg.get("flat_scale_mult", None)
     flat_scale_mult = 1.0 / float(np.sqrt(max(flat_keep, 1e-6))) if flat_scale_mult is None else float(flat_scale_mult)
     flat_gen = torch.Generator(device="cpu").manual_seed(int(cfg.get("flat_seed", 0)))
+    # flat_rebalance（方案 B2，總點數不變的重新分配）：抽樣權重圖中平坦像素 × flat_keep，每個 ref 仍抽 M_ref 個
+    # → 每台 ref 的平坦:複雜密度比 = flat_keep。scale 依該 ref 的期望密度變化：
+    #   p_f = W_f/(W_f+W_c)（原版平坦比例），q_f = keep·W_f/(keep·W_f+W_c)
+    #   平坦點 × 1/√(q_f/p_f)、複雜點 × 1/√((1−q_f)/(1−p_f))（W = 權重和；與原版同覆蓋面積）
+    flat_rebalance = bool(cfg.get("flat_rebalance", False))
     all_flat, debug_flat, flat_stats = [], {}, {}
     if flat_tau > 0:
         print(f"[EDGS] flat thinning: k={flat_k} tau={flat_tau} keep={flat_keep} scale_mult={flat_scale_mult:.4f}")
@@ -644,31 +649,58 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
 
             # Select based on certainty elements with high confidence. These are basically all of
             # kptsA_np.
-            good_samples = torch.multinomial(certainty,
-                                             num_samples=min(expansion_factor * M_ref, len(certainty)),
-                                             replacement=False)
-
-            is_flat = torch.zeros(len(good_samples), dtype=torch.bool, device=good_samples.device)
+            flat_map = None
             if flat_tau > 0:
-                x = torch.from_numpy(np.ascontiguousarray(imA)).to(good_samples.device).permute(2, 0, 1)[None].float()
+                x = torch.from_numpy(np.ascontiguousarray(imA)).to(certainty.device).permute(2, 0, 1)[None].float()
                 pool = lambda t: F.avg_pool2d(t, flat_k, stride=1, padding=flat_k // 2, count_include_pad=False)
                 mu = pool(x)
                 local_std = (pool(x * x) - mu * mu).clamp_min(0).sqrt().mean(1, keepdim=True)
                 if tuple(local_std.shape[-2:]) != tuple(certainties_max.shape):
                     local_std = F.interpolate(local_std, size=tuple(certainties_max.shape), mode="nearest")
                 flat_map = local_std[0, 0] < flat_tau
-                is_flat = flat_map.reshape(-1)[good_samples]
-                keep = ~is_flat | (torch.rand(len(good_samples), generator=flat_gen) < flat_keep).to(good_samples.device)
-                n_before = len(good_samples)
-                good_samples, is_flat = good_samples[keep], is_flat[keep]
+            flat_flat = flat_map.reshape(-1) if flat_map is not None else None
+
+            if flat_map is not None and flat_rebalance:
+                # B2：平坦權重 × keep，每 ref 仍抽 M_ref 個
+                W_f = float(certainty[flat_flat].sum()); W_c = float(certainty[~flat_flat].sum())
+                p_f = W_f / max(W_f + W_c, 1e-12)
+                q_f = flat_keep * W_f / max(flat_keep * W_f + W_c, 1e-12)
+                sf = 1.0 / float(np.sqrt(max(q_f / max(p_f, 1e-12), 1e-6))) if p_f > 0 else 1.0
+                sc = 1.0 / float(np.sqrt(max((1 - q_f) / max(1 - p_f, 1e-12), 1e-6))) if p_f < 1 else 1.0
+                w = certainty.clone()
+                w[flat_flat] *= flat_keep
+                good_samples = torch.multinomial(w, num_samples=min(expansion_factor * M_ref, int((w > 0).sum())),
+                                                 replacement=False)
+                is_flat = flat_flat[good_samples]
+                pt_scale = torch.where(is_flat, sf, sc).float()
                 M_ref = len(good_samples)
-                flat_stats[ref_key] = {"pix_flat": round(float(flat_map.float().mean()), 4), "n_before": n_before,
-                                       "n_flat_before": int(n_before - int(keep.sum()) + int(is_flat.sum())),
+                flat_stats[ref_key] = {"pix_flat": round(float(flat_map.float().mean()), 4), "p_flat": round(p_f, 4),
+                                       "q_flat": round(q_f, 4), "scale_flat": round(sf, 4), "scale_complex": round(sc, 4),
                                        "n_after": M_ref, "n_flat_after": int(is_flat.sum())}
+                print(f"[EDGS] ref {ref_key}: B2 flat share {p_f:.3f} -> {q_f:.3f}, samples {M_ref} "
+                      f"(flat {int(is_flat.sum())}), scale flat x{sf:.3f} complex x{sc:.3f}")
+            else:
+                good_samples = torch.multinomial(certainty,
+                                                 num_samples=min(expansion_factor * M_ref, len(certainty)),
+                                                 replacement=False)
+                is_flat = torch.zeros(len(good_samples), dtype=torch.bool, device=good_samples.device)
+                pt_scale = torch.ones(len(good_samples), device=good_samples.device)
+                if flat_map is not None:
+                    # 方案 A：非平坦樣本同原版，平坦樣本以 keep 機率保留、scale × flat_scale_mult
+                    is_flat = flat_flat[good_samples]
+                    keep = ~is_flat | (torch.rand(len(good_samples), generator=flat_gen) < flat_keep).to(good_samples.device)
+                    n_before = len(good_samples)
+                    good_samples, is_flat = good_samples[keep], is_flat[keep]
+                    pt_scale = torch.where(is_flat, flat_scale_mult, 1.0).float()
+                    M_ref = len(good_samples)
+                    flat_stats[ref_key] = {"pix_flat": round(float(flat_map.float().mean()), 4), "n_before": n_before,
+                                           "n_flat_before": int(n_before - int(keep.sum()) + int(is_flat.sum())),
+                                           "n_after": M_ref, "n_flat_after": int(is_flat.sum())}
+                    print(f"[EDGS] ref {ref_key}: flat pix {flat_stats[ref_key]['pix_flat']:.3f}, "
+                          f"samples {n_before} -> {M_ref} (flat {flat_stats[ref_key]['n_flat_before']} -> {int(is_flat.sum())})")
+            if flat_map is not None:
                 debug_flat[ref_key] = F.interpolate(flat_map[None, None].float(), scale_factor=0.25,
                                                     mode="area")[0, 0].half().cpu().numpy()
-                print(f"[EDGS] ref {ref_key}: flat pix {flat_stats[ref_key]['pix_flat']:.3f}, "
-                      f"samples {n_before} -> {M_ref} (flat {flat_stats[ref_key]['n_flat_before']} -> {int(is_flat.sum())})")
 
         certainties_max, warps_max, certainties_max_idcs, imA, imB_compound, certainties_all, warps_all
         reference_image_dict = {
@@ -727,7 +759,7 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
             dist_points_to_cam1 = torch.linalg.norm(viewpoint_cam1.camera_center.clone().detach() - new_xyz,
                                                     dim=1, ord=2)
             #all_new_scaling.append(torch.log(((dist_points_to_cam1) / 1. * scaling_factor).unsqueeze(1).repeat(1, 3)))
-            scale_mult = torch.where(is_flat.to(new_xyz.device), flat_scale_mult, 1.0).to(new_xyz.dtype)
+            scale_mult = pt_scale.to(device=new_xyz.device, dtype=new_xyz.dtype)
             all_new_scaling.append(gaussians.scaling_inverse_activation(
                 (dist_points_to_cam1 * scaling_factor * scale_mult).unsqueeze(1).repeat(1, 3)))
             all_flat.append(is_flat.cpu().numpy())
@@ -756,7 +788,8 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
             np.save(os.path.join(scene.model_path, "roma_init_flat.npy"), np.concatenate(all_flat))
             np.savez_compressed(os.path.join(scene.model_path, "roma_flat_mask.npz"), **debug_flat)
             import json
-            json.dump({"k": flat_k, "tau": flat_tau, "keep": flat_keep, "scale_mult": flat_scale_mult, "refs": flat_stats},
+            json.dump({"k": flat_k, "tau": flat_tau, "keep": flat_keep, "scale_mult": flat_scale_mult,
+                       "rebalance": flat_rebalance, "refs": flat_stats},
                       open(os.path.join(scene.model_path, "roma_flat_stats.json"), "w"), indent=1)
 
     return viewpoint_stack, closest_indices_selected, visualizations

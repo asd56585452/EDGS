@@ -54,6 +54,7 @@ init_wC:
   flat_keep: 1.0
   flat_scale_mult: null
   flat_seed: 0
+  flat_rebalance: False # True = 方案 B2：平坦權重 × flat_keep、每 ref 仍抽 matches_per_ref，scale 依該 ref 密度變化調整
   # 僅 use=False（自訂 PLY）時有效；預設維持 3DGS create_from_pcd 行為（opacity 0.1、KNN scale）
   custom_opacity: null # 例如 0.5 = 與原生 RoMa 初始化相同
   custom_scale: knn # knn | cam_dist（到最近訓練相機距離 × scaling_factor，同原生 RoMa）
