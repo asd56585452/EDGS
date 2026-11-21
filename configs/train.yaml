@@ -44,6 +44,8 @@ init_wC:
   scaling_factor: 0.001
   proj_err_tolerance: 0.01
   roma_model: "outdoors" # you can change this to "indoors" or "outdoors"
+  # True：RoMa 原生細化（upsample_res 864×864，同 romatch match() / FT++）；False = 原版（只用 560×560 粗匹配）
+  roma_upsample: False
   add_SfM_init : False
   # 可選：ref 相機靜態遮罩 npz（key = 影像名不含副檔名，值 = bool，True = 靜態）；ref 抽樣數 = matches_per_ref × 靜態比例
   static_mask_npz: null
@@ -54,6 +56,8 @@ init_wC:
   flat_keep: 1.0
   flat_scale_mult: null
   flat_seed: 0
+  select_by: error # error = 原版（3 個鄰居中重投影誤差最小）；cert = 該樣本 RoMa certainty 最高的鄰居
+  dump_matches: False # True：存 roma_matches.npz（逐樣本匹配紀錄，分析用；不影響結果）
   flat_rebalance: False # True = 方案 B2：平坦權重 × flat_keep、每 ref 仍抽 matches_per_ref，scale 依該 ref 密度變化調整
   # 僅 use=False（自訂 PLY）時有效；預設維持 3DGS create_from_pcd 行為（opacity 0.1、KNN scale）
   custom_opacity: null # 例如 0.5 = 與原生 RoMa 初始化相同

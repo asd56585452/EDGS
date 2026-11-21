@@ -20,6 +20,7 @@ from utils.sh_utils import RGB2SH
 from romatch.utils import get_tuple_transform_ops
 
 import time
+import math
 from collections import defaultdict
 from tqdm import tqdm
 
@@ -147,18 +148,30 @@ def compute_warp_and_confidence(viewpoint_cam1, viewpoint_cam2, roma_model, devi
     corresps = roma_model.forward(batch) if not roma_model.symmetric else roma_model.forward_symmetric(batch)
     finest_scale = 1
     hs, ws = roma_model.upsample_res if roma_model.upsample_preds else (hs, ws)
+    # 選用（init_wC.roma_upsample）：RoMa 原生細化，同 romatch RegressionMatcher.match() 的 upsample_preds 路徑
+    # （影像重縮到 upsample_res，以粗匹配為起點、upsample=True 再跑一次 decoder；FT++ 即走此路徑）。
+    # 原版 EDGS 在 upsample_preds=True 時只做雙線性放大，不跑細化網路。
+    refine = bool(getattr(roma_model, "edgs_refine", False)) and roma_model.upsample_preds
+    if refine:
+        low_res = corresps[16]["certainty"] if roma_model.attenuate_cert else None
+        up_transform = get_tuple_transform_ops(resize=(hs, ws), normalize=True)
+        im_A2, im_B2 = up_transform((imA, imB))
+        scale_factor = math.sqrt(hs * ws / (roma_model.w_resized * roma_model.h_resized))
+        batch2 = {"im_A": im_A2[None].to(device), "im_B": im_B2[None].to(device), "corresps": corresps[finest_scale]}
+        fwd = roma_model.forward_symmetric if roma_model.symmetric else roma_model.forward
+        corresps = fwd(batch2, batched=True, upsample=True, scale_factor=scale_factor)
 
     # Process certainty and warp
     certainty = corresps[finest_scale]["certainty"]
     im_A_to_im_B = corresps[finest_scale]["flow"]
     if roma_model.attenuate_cert:
         low_res_certainty = F.interpolate(
-            corresps[16]["certainty"], size=(hs, ws), align_corners=False, mode="bilinear"
+            (low_res if refine else corresps[16]["certainty"]), size=(hs, ws), align_corners=False, mode="bilinear"
         )
         certainty -= 0.5 * low_res_certainty * (low_res_certainty < 0)
 
-    # Upsample predictions if needed
-    if roma_model.upsample_preds:
+    # Upsample predictions if needed（細化後已是 upsample_res，不再插值）
+    if roma_model.upsample_preds and not refine:
         im_A_to_im_B = F.interpolate(
             im_A_to_im_B, size=(hs, ws), align_corners=False, mode="bilinear"
         )
@@ -539,7 +552,8 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
             roma_model = roma_indoor(device=device)
         else:
             roma_model = roma_outdoor(device=device)
-        roma_model.upsample_preds = False
+        roma_model.upsample_preds = bool(cfg.get("roma_upsample", False))
+        roma_model.edgs_refine = roma_model.upsample_preds
         roma_model.symmetric = False
     M = cfg.matches_per_ref
     upper_thresh = roma_model.sample_thresh
@@ -559,6 +573,9 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
         print(f"[EDGS] static masks: {cfg.static_mask_npz} ({len(static_masks)} cams)")
     debug_cert = {}
     all_src_names = []
+    # 可選（init_wC.dump_matches）：每個 ref 的逐樣本匹配紀錄（ref 像素、各 NN 的對應像素 / certainty / 三角化點 / 重投影誤差、最終選中的 NN），
+    # 存成 roma_matches.npz，供事後分析 RoMa 為何給出某些點；不影響任何計算結果。
+    dump_matches = bool(cfg.get("dump_matches", False)); match_dump = {}
     # 可選：低紋理（平坦）區減點。ref 影像（訓練解析度）k×k 視窗 RGB 標準差（0–255，三通道平均）< flat_tau 視為平坦。
     # 先照原版抽 M_ref 個樣本（全域 RNG 串流不變 → 非平坦樣本與原版完全相同），平坦樣本再以 flat_keep 機率保留
     # （獨立 Generator），保留的平坦點 scale × flat_scale_mult（null = 1/√flat_keep，維持覆蓋面積）。flat_tau ≤ 0 = 關閉。
@@ -730,6 +747,9 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
                     k1_x=kptsA_np[:M_ref, 0], k1_y=kptsA_np[:M_ref, 1],
                     k2_x=kptsB_np[:M_ref, 0], k2_y=kptsB_np[:M_ref, 1])
 
+                if dump_matches:
+                    reference_image_dict.setdefault("kB", []).append(np.asarray(kptsB_np[:M_ref]).copy())
+                    reference_image_dict["kA"] = np.asarray(kptsA_np[:M_ref]).copy()
                 reference_image_dict["triangulated_points"].append(triangulated_points)
                 reference_image_dict["triangulated_points_errors_proj1"].append(triangulated_points_errors_proj1)
                 reference_image_dict["triangulated_points_errors_proj2"].append(triangulated_points_errors_proj2)
@@ -739,7 +759,27 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
                 NNs_triangulated_points=torch.stack(reference_image_dict["triangulated_points"], dim=0),
                 NNs_errors_proj1=np.stack(reference_image_dict["triangulated_points_errors_proj1"], axis=0),
                 NNs_errors_proj2=np.stack(reference_image_dict["triangulated_points_errors_proj2"], axis=0))
+            # 可選（init_wC.select_by=cert）：改選「該樣本 RoMa certainty 最高的鄰居」的三角化結果（原版 = 重投影誤差最小，不看 certainty；
+            # 兩視角重投影誤差無法驗證深度，遠景低視差的正確配對誤差反而較大，會被淘汰）。誤差欄位改為該鄰居的誤差（供 bad-point 遮罩）。
+            if cfg.get("select_by", "error") == "cert":
+                _c = torch.stack([c_.reshape(-1)[good_samples] for c_ in certainties_all], 0)
+                _q = torch.argmax(_c, 0).to(NNs_triangulated_points_selected.device)
+                _tp = torch.stack(reference_image_dict["triangulated_points"], dim=0)
+                NNs_triangulated_points_selected = _tp[_q, torch.arange(_tp.shape[1], device=_tp.device)]
+                _e = np.maximum(np.stack(reference_image_dict["triangulated_points_errors_proj1"], 0),
+                                np.stack(reference_image_dict["triangulated_points_errors_proj2"], 0))
+                NNs_triangulated_points_selected_proj_errors = _e[_q.cpu().numpy(), np.arange(_e.shape[1])]
 
+        if dump_matches:
+            _rk = os.path.splitext(viewpoint_stack[source_idx].image_name)[0]
+            _err = np.maximum(np.stack(reference_image_dict["triangulated_points_errors_proj1"], 0),
+                              np.stack(reference_image_dict["triangulated_points_errors_proj2"], 0))
+            _cert = torch.stack([c_.reshape(-1)[good_samples] for c_ in certainties_all], 0).float().cpu().numpy()
+            _xyz = torch.stack(reference_image_dict["triangulated_points"], 0)[..., :3].float().cpu().numpy()
+            match_dump[_rk] = dict(kA=reference_image_dict["kA"], kB=np.stack(reference_image_dict["kB"], 0), err=_err, cert=_cert, xyz=_xyz,
+                                   chosen=(np.argmax(_cert, 0) if cfg.get("select_by", "error") == "cert" else np.argmin(_err, 0)), cert_max_idx=certainties_max_idcs.reshape(-1)[good_samples].cpu().numpy(),
+                                   nn=np.array([os.path.splitext(viewpoint_stack[j].image_name)[0] for j in closest_indices_selected[source_idx]]),
+                                   im_hw=np.array(imA.shape[:2]))
         # 4. Save as gaussians
         viewpoint_cam1 = viewpoint_stack[source_idx]
         N = len(NNs_triangulated_points_selected)
@@ -780,6 +820,9 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
     if getattr(scene, "model_path", None):
         # 每個新點的 ref 相機名稱（順序同 roma_init.ply），供 static.ply 的 src_cam 欄位
         np.save(os.path.join(scene.model_path, "roma_init_src_cam.npy"), np.asarray(all_src_names))
+        if dump_matches:
+            np.savez_compressed(os.path.join(scene.model_path, "roma_matches.npz"),
+                                **{f"{rk}__{k}": v for rk, dd in match_dump.items() for k, v in dd.items()})
         if debug_cert:
             # 遮罩後的 C_max（1/4 解析度），供 RRD 視覺化
             np.savez_compressed(os.path.join(scene.model_path, "roma_masked_cert.npz"), **debug_cert)
@@ -865,7 +908,8 @@ def init_gaussians_with_corr_fast(gaussians, scene, cfg, device, verbose=False, 
             roma_model = roma_indoor(device=device)
         else:
             roma_model = roma_outdoor(device=device)
-        roma_model.upsample_preds = False
+        roma_model.upsample_preds = bool(cfg.get("roma_upsample", False))
+        roma_model.edgs_refine = roma_model.upsample_preds
         roma_model.symmetric = False
 
     M = cfg.matches_per_ref
