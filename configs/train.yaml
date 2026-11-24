@@ -56,7 +56,9 @@ init_wC:
   flat_keep: 1.0
   flat_scale_mult: null
   flat_seed: 0
-  select_by: error # error = 原版（3 個鄰居中重投影誤差最小）；cert = 該樣本 RoMa certainty 最高的鄰居
+  select_by: error # error = 原版（3 個鄰居中重投影誤差最小）；cert = 該樣本 RoMa certainty 最高的鄰居；cert_vote = cert + 深度投票刪點
+  vote_cert: 0.2 # cert_vote：certainty ≥ 此值的鄰居才有投票權
+  vote_tol: 0.1 # cert_vote：與選中鄰居的深度相對差 < 此值算一致
   dump_matches: False # True：存 roma_matches.npz（逐樣本匹配紀錄，分析用；不影響結果）
   flat_rebalance: False # True = 方案 B2：平坦權重 × flat_keep、每 ref 仍抽 matches_per_ref，scale 依該 ref 密度變化調整
   # 僅 use=False（自訂 PLY）時有效；預設維持 3DGS create_from_pcd 行為（opacity 0.1、KNN scale）

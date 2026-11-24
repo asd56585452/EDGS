@@ -576,6 +576,7 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
     # 可選（init_wC.dump_matches）：每個 ref 的逐樣本匹配紀錄（ref 像素、各 NN 的對應像素 / certainty / 三角化點 / 重投影誤差、最終選中的 NN），
     # 存成 roma_matches.npz，供事後分析 RoMa 為何給出某些點；不影響任何計算結果。
     dump_matches = bool(cfg.get("dump_matches", False)); match_dump = {}
+    all_vote_drop = []  # select_by=cert_vote：每點是否被投票刪除（順序同 roma_init.ply）
     # 可選：低紋理（平坦）區減點。ref 影像（訓練解析度）k×k 視窗 RGB 標準差（0–255，三通道平均）< flat_tau 視為平坦。
     # 先照原版抽 M_ref 個樣本（全域 RNG 串流不變 → 非平坦樣本與原版完全相同），平坦樣本再以 flat_keep 機率保留
     # （獨立 Generator），保留的平坦點 scale × flat_scale_mult（null = 1/√flat_keep，維持覆蓋面積）。flat_tau ≤ 0 = 關閉。
@@ -761,7 +762,8 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
                 NNs_errors_proj2=np.stack(reference_image_dict["triangulated_points_errors_proj2"], axis=0))
             # 可選（init_wC.select_by=cert）：改選「該樣本 RoMa certainty 最高的鄰居」的三角化結果（原版 = 重投影誤差最小，不看 certainty；
             # 兩視角重投影誤差無法驗證深度，遠景低視差的正確配對誤差反而較大，會被淘汰）。誤差欄位改為該鄰居的誤差（供 bad-point 遮罩）。
-            if cfg.get("select_by", "error") == "cert":
+            vote_drop = np.zeros(len(NNs_triangulated_points_selected), bool)
+            if cfg.get("select_by", "error") in ("cert", "cert_vote"):
                 _c = torch.stack([c_.reshape(-1)[good_samples] for c_ in certainties_all], 0)
                 _q = torch.argmax(_c, 0).to(NNs_triangulated_points_selected.device)
                 _tp = torch.stack(reference_image_dict["triangulated_points"], dim=0)
@@ -769,6 +771,17 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
                 _e = np.maximum(np.stack(reference_image_dict["triangulated_points_errors_proj1"], 0),
                                 np.stack(reference_image_dict["triangulated_points_errors_proj2"], 0))
                 NNs_triangulated_points_selected_proj_errors = _e[_q.cpu().numpy(), np.arange(_e.shape[1])]
+                if cfg.get("select_by", "error") == "cert_vote":
+                    # 投票（init_wC.vote_cert、vote_tol）：certainty ≥ vote_cert 的鄰居才有投票權；選中的（certainty 最高）若有 ≥ 2 台有投票權的鄰居，
+                    # 但沒有任何一台其他有權鄰居的深度（到 ref 相機距離）和它相差 < vote_tol，判為深度不一致 → 標記刪除（透明度設極低，同壞點）。
+                    # 只有 0–1 台有權鄰居（例如其他鄰居看不到 / 被遮擋）的點照原樣保留。
+                    _cen = viewpoint_stack[source_idx].camera_center.to(_tp.device)
+                    _d = torch.linalg.norm(_tp[..., :3] - _cen, dim=-1)  # [NN, M]
+                    _conf = _c.to(_tp.device) >= float(cfg.get("vote_cert", 0.2))
+                    _dq = _d[_q, torch.arange(_d.shape[1], device=_d.device)]
+                    _agree = ((_d - _dq).abs() / torch.minimum(_d, _dq).clamp_min(1e-6) < float(cfg.get("vote_tol", 0.1))) & _conf
+                    _agree[_q, torch.arange(_d.shape[1], device=_d.device)] = False
+                    vote_drop = ((_conf.sum(0) >= 2) & (_agree.sum(0) == 0)).cpu().numpy()
 
         if dump_matches:
             _rk = os.path.splitext(viewpoint_stack[source_idx].image_name)[0]
@@ -792,9 +805,10 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
             # new version that sets points with large error invisible
             # TODO: remove those points instead. However it doesn't affect the performance.
             mask_bad_points = torch.tensor(
-                NNs_triangulated_points_selected_proj_errors > keypoint_fit_error_tolerance,
+                (NNs_triangulated_points_selected_proj_errors > keypoint_fit_error_tolerance) | vote_drop,
                 dtype=torch.float32).unsqueeze(1).to(device)
             all_new_opacities.append(torch.stack([gaussians._opacity[-1].clone().detach()] * N, dim=0) * 0. - mask_bad_points * (1e1))
+            all_vote_drop.append(vote_drop)
 
             dist_points_to_cam1 = torch.linalg.norm(viewpoint_cam1.camera_center.clone().detach() - new_xyz,
                                                     dim=1, ord=2)
@@ -820,6 +834,8 @@ def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, rom
     if getattr(scene, "model_path", None):
         # 每個新點的 ref 相機名稱（順序同 roma_init.ply），供 static.ply 的 src_cam 欄位
         np.save(os.path.join(scene.model_path, "roma_init_src_cam.npy"), np.asarray(all_src_names))
+        if cfg.get("select_by", "error") == "cert_vote":
+            np.save(os.path.join(scene.model_path, "roma_init_vote_drop.npy"), np.concatenate(all_vote_drop))
         if dump_matches:
             np.savez_compressed(os.path.join(scene.model_path, "roma_matches.npz"),
                                 **{f"{rk}__{k}": v for rk, dd in match_dump.items() for k, v in dd.items()})
